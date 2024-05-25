@@ -1,0 +1,320 @@
+Transform: AWS::Serverless-2016-10-31
+Description: 'Knowledge Base for Amazon Bedrock with A OpenSearch Serverless (including index setup)'
+
+Mappings:
+  IndexMap:
+    OSSIndexName:
+      Name: bedrock-knowledge-base-default-index
+    OSSVectorField:
+      Name: bedrock-knowledge-base-default-vector
+    OSSMappingText:
+      Name: AMAZON_BEDROCK_TEXT_CHUNK
+    OSSMappingMetadata:
+      Name: AMAZON_BEDROCK_METADATA
+
+Parameters:
+  EmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v1
+    AllowedValues:
+      - amazon.titan-embed-text-v1
+      - cohere.embed-english-v3
+      - cohere.embed-multilingual-v3
+    Description: 'The Id of the Bedrock model that is used to generate embeddings.'
+  OSSCollectionStandbyReplicas:
+    Type: String
+    Default: 'DISABLED'
+    Description: 'DISABLED is suitable for production environments. ENABLED is suitable for development environments.'
+    AllowedValues:
+      - 'DISABLED'
+      - 'ENABLED'
+  OSSDataAccessPrincipalArn:
+    Type: String
+    Description: 'The ARN of the IAM user or role that has access to the data in the collection.'
+
+Conditions:
+  IsTitanEmbedTextV1: !Equals [!Ref EmbeddingModelId, "amazon.titan-embed-text-v1"]
+
+Resources:
+  BedrockFMPolicyForKB:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-bedrock-fm-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: BedrockInvokeModelStatement
+            Effect: Allow
+            Action:
+              - 'bedrock:InvokeModel'
+            Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}
+      Roles:
+        - !Ref BedrockKnowledgeBaseRole
+
+  BedrockOSSPolicyForKB:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-bedrock-oss-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: OpenSearchServerlessAPIAccessAllStatement
+            Effect: Allow
+            Action:
+              - 'aoss:APIAccessAll'
+            Resource: !GetAtt OSSCollection.Arn
+      Roles:
+        - !Ref BedrockKnowledgeBaseRole
+        - !Ref CreateIndexFunctionRole
+
+  BedrockS3PolicyForKB:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-bedrock-s3-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ListBucketStatement
+            Effect: Allow
+            Action:
+              - 's3:ListBucket'
+            Resource: !GetAtt  DataSourceBucket.Arn
+            Condition:
+              StringEquals:
+                aws:ResourceAccount: !Ref 'AWS::AccountId'
+          - Sid: S3GetObjectStatement
+            Effect: Allow
+            Action:
+              - 's3:GetObject'
+            Resource:
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref DataSourceBucket
+                  - '/*'
+            Condition:
+              StringEquals:
+                aws:ResourceAccount: !Ref 'AWS::AccountId'
+      Roles:
+        - !Ref BedrockKnowledgeBaseRole
+
+  OSSCollection:
+    Type: 'AWS::OpenSearchServerless::Collection'
+    Properties:
+      Name: !Sub '${AWS::StackName}-col'
+      Type: VECTORSEARCH
+      StandbyReplicas: !Ref OSSCollectionStandbyReplicas
+    DependsOn: OSSEncryptionPolicy
+  OSSEncryptionPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: !Sub '${AWS::StackName}-ep'
+      Type: encryption
+      Policy: !Sub >-
+        {
+            "Rules": [
+                {
+                    "Resource": [
+                        "collection/${AWS::StackName}-col"
+                    ],
+                    "ResourceType": "collection"
+                }
+            ],
+            "AWSOwnedKey": true
+        }
+  OSSNetworkPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: !Sub '${AWS::StackName}-np'
+      Type: network
+      Policy: !Sub >-
+        [
+            {
+                "Rules": [
+                    {
+                        "Resource": [
+                            "collection/${AWS::StackName}-col"
+                        ],
+                        "ResourceType": "dashboard"
+                    },
+                    {
+                        "Resource": [
+                            "collection/${AWS::StackName}-col"
+                        ],
+                        "ResourceType": "collection"
+                    }
+                ],
+                "AllowFromPublic": true
+            }
+        ]
+  OSSDataAccessPolicy:
+    Type: 'AWS::OpenSearchServerless::AccessPolicy'
+    Properties:
+      Name: !Sub '${AWS::StackName}-dp'
+      Type: data
+      Policy: !Sub
+        - >-
+            [
+                {
+                    "Rules": [
+                        {
+                            "Resource": [
+                                "collection/${AWS::StackName}-col"
+                            ],
+                            "Permission": [
+                                "aoss:CreateCollectionItems",
+                                "aoss:UpdateCollectionItems",
+                                "aoss:DescribeCollectionItems"
+                            ],
+                            "ResourceType": "collection"
+                        },
+                        {
+                            "Resource": [
+                                "index/${AWS::StackName}-col/*"
+                            ],
+                            "Permission": [
+                                "aoss:CreateIndex",
+                                "aoss:UpdateIndex",
+                                "aoss:DescribeIndex",
+                                "aoss:ReadDocument",
+                                "aoss:WriteDocument"
+                            ],
+                            "ResourceType": "index"
+                        }
+                    ],
+                    "Principal": [
+                        "${BedrockKnowledgeBaseRoleArn}",
+                        "${CreateIndexFunctionRoleArn}",
+                        "${OSSDataAccessPrincipalArn}"
+                    ],
+                    "Description": ""
+                }
+            ]
+        - BedrockKnowledgeBaseRoleArn: !GetAtt BedrockKnowledgeBaseRole.Arn
+          CreateIndexFunctionRoleArn: !GetAtt CreateIndexFunctionRole.Arn
+
+  SetupOSSIndex:
+    Type: 'Custom::OpenSearchServerlessIndex'
+    Properties:
+      ServiceToken: !GetAtt CreateIndexFunction.Arn
+      Region: !Ref 'AWS::Region'
+      Dimension: !If [IsTitanEmbedTextV1, 1536, 1024]
+      EmbeddingModelId: !Ref EmbeddingModelId
+      CollectionId: !GetAtt OSSCollection.Id
+      IndexName: !FindInMap [IndexMap, OSSIndexName, Name]
+      VectorField: !FindInMap [IndexMap, OSSVectorField, Name]
+      MappingText: !FindInMap [IndexMap, OSSMappingText, Name]
+      MappingMetadata: !FindInMap [IndexMap, OSSMappingMetadata, Name]
+    DependsOn:
+      - BedrockOSSPolicyForKB
+
+  CreateIndexFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-create-index-function-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  CreateIndexFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-create-index-function'
+      Handler: index.lambda_handler
+      Role: !GetAtt CreateIndexFunctionRole.Arn
+      Runtime: python3.12
+      Timeout: 600
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: INFO
+      Layers:
+        - !Ref OSSLayer
+      CodeUri: function/
+
+  OSSLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub '${AWS::StackName}-create-index-function-layer'
+      ContentUri: layer/
+      CompatibleRuntimes:
+        - python3.12
+    Metadata:
+      BuildMethod: python3.12
+
+  BedrockKnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-bedrock-kb-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [bedrock.amazonaws.com]
+            Action: ['sts:AssumeRole']
+
+  BedrockKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: !Sub ${AWS::StackName}-knowledge-base
+      KnowledgeBaseConfiguration:
+          Type: VECTOR
+          VectorKnowledgeBaseConfiguration:
+            EmbeddingModelArn: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}
+      RoleArn: !GetAtt BedrockKnowledgeBaseRole.Arn
+      StorageConfiguration:
+        Type: OPENSEARCH_SERVERLESS
+        OpensearchServerlessConfiguration:
+            CollectionArn: !GetAtt OSSCollection.Arn
+            FieldMapping:
+              MetadataField: !FindInMap [IndexMap, OSSMappingMetadata, Name]
+              TextField: !FindInMap [IndexMap, OSSMappingText, Name]
+              VectorField: !FindInMap [IndexMap, OSSVectorField, Name]
+            VectorIndexName: !FindInMap [IndexMap, OSSIndexName, Name]
+    DependsOn: SetupOSSIndex
+
+  BedrockKnowledgeBaseDS:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      DataDeletionPolicy: RETAIN
+      KnowledgeBaseId: !Ref BedrockKnowledgeBase
+      Name: !Sub ${AWS::StackName}-data-source
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt DataSourceBucket.Arn
+
+  DataSourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-bedrock-kb-ds-bucket-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+Outputs:
+  BedrockKnowledgeBaseId:
+    Value: !Ref BedrockKnowledgeBase
+  BedrockDataSourceId:
+    Value: !Ref BedrockKnowledgeBaseDS
+  OSSCollectionId:
+    Value: !Ref OSSCollection
+  DSBucketName:
+    Value: !Ref DataSourceBucket
