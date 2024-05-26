@@ -15,7 +15,7 @@ Mappings:
 Parameters:
   EmbeddingModelId:
     Type: String
-    Default: amazon.titan-embed-text-v1
+    Default: cohere.embed-multilingual-v3
     AllowedValues:
       - amazon.titan-embed-text-v1
       - cohere.embed-english-v3
