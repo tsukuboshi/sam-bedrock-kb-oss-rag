@@ -24,7 +24,7 @@ Parameters:
   OSSCollectionStandbyReplicas:
     Type: String
     Default: 'DISABLED'
-    Description: 'DISABLED is suitable for production environments. ENABLED is suitable for development environments.'
+    Description: 'ENABLED is suitable for production environments. DISABLED is suitable for development environments.'
     AllowedValues:
       - 'DISABLED'
       - 'ENABLED'
